@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
+	"os"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tailscale.com/tsnet"
 
 	"github.com/glanceapp/glance/internal/assets"
 	"github.com/glanceapp/glance/internal/widget"
@@ -47,6 +51,7 @@ type Server struct {
 	BaseURL    string    `yaml:"base-url"`
 	AssetsHash string    `yaml:"-"`
 	StartedAt  time.Time `yaml:"-"` // used in custom css file
+	Tailscale  bool      `yaml:"tailscale"`
 }
 
 type Branding struct {
@@ -265,6 +270,65 @@ func (a *Application) AssetPath(asset string) string {
 	return a.Config.Server.BaseURL + "/static/" + a.Config.Server.AssetsHash + "/" + asset
 }
 
+// tailscaleListener sets up HTTP(s) listeners on the tailnet.
+func tailscaleListener(hostname string, tsnetLogs bool) (*net.Listener, error) {
+	tsLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
+
+	tsnetServer := &tsnet.Server{
+		Hostname: hostname,
+		Logf: func(msg string, args ...any) {
+			l := tsLogger.With(slog.String("source", "tsnet"), slog.String("hostname", hostname))
+			l.Info(fmt.Sprintf(msg, args...))
+		},
+	}
+
+	if !tsnetLogs {
+		tsnetServer.Logf = func(string, ...any) {}
+		slog.Warn("tsnet logs are disabled, interactive auth link will not be shown")
+	}
+
+	// Start a standard HTTP server in the background to redirect HTTP -> HTTPS.
+	go func() {
+		httpLn, err := tsnetServer.Listen("tcp", ":80")
+		if err != nil {
+			slog.Error("unable to start HTTP listener, redirects from http->https will not work")
+			return
+		}
+
+		slog.Info(fmt.Sprintf("started HTTP listener with tsnet at %s:80", hostname))
+
+		err = http.Serve(httpLn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			newURL := fmt.Sprintf("https://%s%s", r.Host, r.RequestURI)
+			http.Redirect(w, r, newURL, http.StatusMovedPermanently)
+		}))
+		if err != nil {
+			slog.Error("unable to start http server, redirects from http->https will not work")
+		}
+	}()
+
+	tlsLn, err := tsnetServer.ListenTLS("tcp", ":443")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tailscale listener: %w", err)
+	}
+
+	return &tlsLn, nil
+}
+
+// httpListener sets up a local TCP listener on the specified addr.
+func httpListener(addr string) (*net.Listener, error) {
+	a, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http listener: %w", err)
+	}
+
+	httpLn, err := net.Listen("tcp", fmt.Sprintf("%s:%d", a.IP, a.Port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http listener: %w", err)
+	}
+
+	return &httpLn, nil
+}
+
 func (a *Application) Serve() error {
 	// TODO: add gzip support, static files must have their gzipped contents cached
 	// TODO: add HTTPS support
@@ -296,13 +360,21 @@ func (a *Application) Serve() error {
 		mux.Handle("/assets/{path...}", http.StripPrefix("/assets/", assetsFS))
 	}
 
-	server := http.Server{
-		Addr:    fmt.Sprintf("%s:%d", a.Config.Server.Host, a.Config.Server.Port),
-		Handler: mux,
+	var listener *net.Listener
+	var err error
+
+	if a.Config.Server.Tailscale {
+		listener, err = tailscaleListener(a.Config.Server.Host, true)
+	} else {
+		listener, err = httpListener(fmt.Sprintf("%s:%d", a.Config.Server.Host, a.Config.Server.Port))
+	}
+	if err != nil {
+		slog.Error("failed to create listener", "error", err.Error())
+		os.Exit(1)
 	}
 
 	a.Config.Server.StartedAt = time.Now()
 	slog.Info("Starting server", "host", a.Config.Server.Host, "port", a.Config.Server.Port, "base-url", a.Config.Server.BaseURL)
 
-	return server.ListenAndServe()
+	return http.Serve(*listener, mux)
 }
